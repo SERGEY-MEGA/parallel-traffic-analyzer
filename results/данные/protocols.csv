@@ -1,0 +1,9 @@
+analysis,protocol_filter,selected_packets,selected_mb,seq_seconds,par4_seconds,speedup,stats_equal
+headers,all,1614642,1048,0.179,0.133,1.35,True
+headers,tcp,968029,629,0.167,0.133,1.26,True
+headers,udp,485087,314,0.162,0.133,1.22,True
+headers,icmp,161526,105,0.153,0.135,1.14,True
+signatures,all,1614642,1048,1.237,0.308,4.02,True
+signatures,tcp,968029,629,0.798,0.231,3.46,True
+signatures,udp,485087,314,0.473,0.200,2.36,True
+signatures,icmp,161526,105,0.260,0.156,1.67,True

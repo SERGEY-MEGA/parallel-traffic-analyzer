@@ -1,0 +1,10 @@
+/analyze
+/generate
+/data/*.pcap
+__pycache__/
+.venv/
+.DS_Store
+*.pyc
+ШПАРГАЛКА.md
+АМДАЛ.md
+DEMO.md

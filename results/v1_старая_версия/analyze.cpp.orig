@@ -1,0 +1,335 @@
+#include "common.h"
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+
+struct Options {
+    std::string file, mode = "seq";
+    unsigned threads = 1;
+    uint64_t limit = 0;
+    int protocol = -1, port = -1;
+    bool has_ip = false, json = false;
+    uint32_t ip = 0;
+};
+
+Options arguments(int argc, char** argv) {
+    if (argc < 2) throw std::runtime_error(
+        "Usage: ./analyze FILE [--mode seq|par] [--threads N] [--limit-mib N] "
+        "[--protocol tcp|udp|icmp] [--ip ADDRESS] [--port N] [--json]");
+    Options o; o.file = argv[1];
+    for (int i = 2; i < argc; ++i) {
+        std::string key = argv[i];
+        if (key == "--json") { o.json = true; continue; }
+        if (i + 1 == argc) throw std::runtime_error("Missing value for " + key);
+        std::string value = argv[++i];
+        if (key == "--mode") o.mode = value;
+        else if (key == "--threads") {
+            auto n = number(value);
+            if (n < 1 || n > 256) throw std::runtime_error("Threads: 1..256");
+            o.threads = unsigned(n);
+        } else if (key == "--limit-mib") {
+            auto n = number(value);
+            if (n > 1024 * 1024) throw std::runtime_error("Limit too large");
+            o.limit = n * MiB;
+        } else if (key == "--protocol") {
+            if (value == "tcp") o.protocol = 6;
+            else if (value == "udp") o.protocol = 17;
+            else if (value == "icmp") o.protocol = 1;
+            else throw std::runtime_error("Protocol: tcp, udp or icmp");
+        } else if (key == "--ip") { o.ip = parse_ip(value); o.has_ip = true; }
+        else if (key == "--port") {
+            auto n = number(value);
+            if (n > 65535) throw std::runtime_error("Port: 0..65535");
+            o.port = int(n);
+        } else throw std::runtime_error("Unknown option: " + key);
+    }
+    if (o.mode != "seq" && o.mode != "par") throw std::runtime_error("Mode: seq or par");
+    if (o.mode == "seq" && o.threads != 1) throw std::runtime_error("seq uses one thread");
+    return o;
+}
+
+class Reader {
+    std::vector<char> buffer;
+    std::ifstream in;
+    uint32_t snaplen = 0;
+    uint64_t limit;
+    bool finished = false;
+public:
+    bool little = true;
+    uint64_t bytes = 24;
+    Reader(const Options& o) : buffer(4 * MiB), limit(o.limit) {
+        in.rdbuf()->pubsetbuf(buffer.data(), std::streamsize(buffer.size()));
+        in.open(o.file, std::ios::binary);
+        if (!in) throw std::runtime_error("Cannot open PCAP file");
+        uint8_t h[24];
+        in.read(reinterpret_cast<char*>(h), 24);
+        if (in.gcount() != 24) throw std::runtime_error("Incomplete PCAP header");
+        uint32_t magic = be32(h);
+        if (magic == 0xd4c3b2a1 || magic == 0x4d3cb2a1) little = true;
+        else if (magic == 0xa1b2c3d4 || magic == 0xa1b23c4d) little = false;
+        else throw std::runtime_error("Expected classic PCAP (pcapng is not supported)");
+        auto field16 = [&](const uint8_t* p) {
+            return little ? uint16_t(p[0] | (uint16_t(p[1]) << 8)) : be16(p);
+        };
+        if (field16(h + 4) != 2 || field16(h + 6) != 4)
+            throw std::runtime_error("Expected PCAP version 2.4");
+        snaplen = word32(h + 16, little);
+        if (!snaplen || snaplen > 16 * MiB) throw std::runtime_error("Unsupported snaplen");
+        if ((word32(h + 20, little) & 65535) != 1)
+            throw std::runtime_error("Only Ethernet PCAP is supported");
+    }
+    // Собираем до 4096 целых записей: граница блока не разрезает пакет.
+    bool next(Bytes& block) {
+        block.clear();
+        if (finished) return false;
+        block.reserve(4 * MiB);
+        for (unsigned i = 0; i < 4096; ++i) {
+            if (limit && bytes + 16 > limit) { finished = true; break; }
+            uint8_t h[16];
+            in.read(reinterpret_cast<char*>(h), 16);
+            if (in.gcount() == 0 && in.eof()) { finished = true; break; }
+            if (in.gcount() != 16) throw std::runtime_error("Incomplete packet record header");
+            uint32_t n = word32(h + 8, little);
+            uint32_t original = word32(h + 12, little);
+            if (n > snaplen || n > original) throw std::runtime_error("Invalid packet record length");
+            if (limit && bytes + 16 + n > limit) { finished = true; break; }
+            size_t start = block.size();
+            block.insert(block.end(), h, h + 16);
+            block.resize(start + 16 + n);
+            in.read(reinterpret_cast<char*>(block.data() + start + 16), n);
+            if (uint32_t(in.gcount()) != n) throw std::runtime_error("Incomplete packet data");
+            bytes += 16 + n;
+            // Также ограничиваем объём блока для файлов с большими пакетами.
+            if (block.size() >= 4 * MiB) break;
+        }
+        return !block.empty();
+    }
+};
+
+struct Counter { uint64_t packets = 0, bytes = 0; };
+struct IPStat { Counter sent, received; };
+struct Stats {
+    uint64_t total = 0, invalid = 0, unsupported = 0, filtered = 0;
+    Counter selected;
+    std::array<Counter, 256> protocols{};
+    std::unordered_map<uint32_t, IPStat> ips;
+};
+
+void packet(const uint8_t* p, size_t n, uint32_t wire, const Options& o, Stats& s) {
+    ++s.total;
+    if (n < 14) { ++s.invalid; return; }
+    size_t offset = 14;
+    uint16_t ether = be16(p + 12);
+    // VLAN добавляет 4 байта между Ethernet и IP; возможны вложенные теги.
+    while (ether == 0x8100 || ether == 0x88a8) {
+        if (n < offset + 4) { ++s.invalid; return; }
+        ether = be16(p + offset + 2); offset += 4;
+    }
+    if (ether != 0x0800) { ++s.unsupported; return; }
+    if (n < offset + 20) { ++s.invalid; return; }
+    const uint8_t* ip = p + offset;
+    size_t ihl = size_t(ip[0] & 15) * 4;
+    uint16_t length = be16(ip + 2);
+    if ((ip[0] >> 4) != 4 || ihl < 20 || length < ihl || n < offset + ihl
+        || wire < offset + length) { ++s.invalid; return; }
+    // Захваченный пакет может быть короче исходного: читаем только доступные байты.
+    size_t available = std::min(n - offset, size_t(length));
+    unsigned proto = ip[9];
+    uint32_t src = be32(ip + 12), dst = be32(ip + 16);
+    bool first_fragment = (be16(ip + 6) & 0x1fff) == 0;
+    bool more_fragments = (be16(ip + 6) & 0x2000) != 0;
+    int sport = -1, dport = -1;
+    if (first_fragment && (proto == 6 || proto == 17)) {
+        size_t min_header = proto == 6 ? 20 : 8;
+        if (!more_fragments && length < ihl + min_header) { ++s.invalid; return; }
+        if (available >= ihl + 4) {
+            sport = be16(ip + ihl); dport = be16(ip + ihl + 2);
+        }
+        if (proto == 6 && available >= ihl + 13) {
+            size_t tcp_header = size_t(ip[ihl + 12] >> 4) * 4;
+            if (tcp_header < 20 || (!more_fragments && length < ihl + tcp_header)) { ++s.invalid; return; }
+        }
+        if (proto == 17 && available >= ihl + 8) {
+            unsigned udp_length = be16(ip + ihl + 4);
+            if (udp_length < 8 || (!more_fragments && udp_length > length - ihl)) {
+                ++s.invalid; return;
+            }
+        }
+    } else if (first_fragment && proto == 1 && length < ihl + 8) {
+        ++s.invalid; return;
+    }
+    if ((o.protocol >= 0 && unsigned(o.protocol) != proto)
+        || (o.has_ip && o.ip != src && o.ip != dst)
+        || (o.port >= 0 && o.port != sport && o.port != dport)) {
+        ++s.filtered; return;
+    }
+    ++s.selected.packets; s.selected.bytes += wire;
+    ++s.protocols[proto].packets; s.protocols[proto].bytes += wire;
+    ++s.ips[src].sent.packets; s.ips[src].sent.bytes += wire;
+    ++s.ips[dst].received.packets; s.ips[dst].received.bytes += wire;
+}
+
+void analyze_block(const Bytes& block, bool little, const Options& o, Stats& stats) {
+    size_t pos = 0;
+    while (pos < block.size()) {
+        uint32_t n = word32(block.data() + pos + 8, little);
+        uint32_t wire = word32(block.data() + pos + 12, little);
+        packet(block.data() + pos + 16, n, wire, o, stats);
+        pos += 16 + n;
+    }
+}
+
+// Общая очередь хранит блоки. Мьютекс нужен только при добавлении и извлечении.
+class Queue {
+    std::deque<Bytes> blocks;
+    std::mutex mutex;
+    std::condition_variable ready, space;
+    size_t capacity;
+    bool closed = false;
+public:
+    explicit Queue(size_t size) : capacity(size) {}
+    void push(Bytes block) {
+        std::unique_lock lock(mutex);
+        space.wait(lock, [&] { return closed || blocks.size() < capacity; });
+        if (closed) return;
+        blocks.push_back(std::move(block)); ready.notify_one();
+    }
+    bool pop(Bytes& block) {
+        std::unique_lock lock(mutex);
+        ready.wait(lock, [&] { return closed || !blocks.empty(); });
+        if (blocks.empty()) return false;
+        block = std::move(blocks.front()); blocks.pop_front(); space.notify_one();
+        return true;
+    }
+    void close() {
+        std::lock_guard lock(mutex);
+        closed = true; ready.notify_all(); space.notify_all();
+    }
+};
+
+void add(Counter& a, const Counter& b) { a.packets += b.packets; a.bytes += b.bytes; }
+void merge(Stats& a, const Stats& b) {
+    a.total += b.total; a.invalid += b.invalid;
+    a.unsupported += b.unsupported; a.filtered += b.filtered;
+    add(a.selected, b.selected);
+    for (size_t i = 0; i < 256; ++i) add(a.protocols[i], b.protocols[i]);
+    for (const auto& [ip, stat] : b.ips) {
+        add(a.ips[ip].sent, stat.sent); add(a.ips[ip].received, stat.received);
+    }
+}
+
+Stats run(Reader& reader, const Options& o) {
+    Stats result;
+    if (o.mode == "seq") {
+        Bytes block;
+        while (reader.next(block)) analyze_block(block, reader.little, o, result);
+        return result;
+    }
+    Queue queue(std::min<size_t>(o.threads * 2, 16));
+    std::vector<Stats> local(o.threads);
+    std::vector<std::thread> workers;
+    std::exception_ptr failure;
+    std::mutex failure_mutex;
+    auto save_failure = [&] {
+        std::lock_guard lock(failure_mutex);
+        if (!failure) failure = std::current_exception();
+        queue.close();
+    };
+    try {
+        for (unsigned i = 0; i < o.threads; ++i) {
+            workers.emplace_back([&, i] {
+                try {
+                    Bytes block;
+                    while (queue.pop(block)) analyze_block(block, reader.little, o, local[i]);
+                } catch (...) { save_failure(); }
+            });
+        }
+        Bytes block;
+        while (reader.next(block)) queue.push(std::move(block));
+    } catch (...) { save_failure(); }
+    queue.close();
+    for (auto& worker : workers) worker.join();
+    if (failure) std::rethrow_exception(failure);
+    for (const auto& stats : local) merge(result, stats);
+    return result;
+}
+
+std::string protocol_name(unsigned p) {
+    if (p == 6) return "TCP";
+    if (p == 17) return "UDP";
+    if (p == 1) return "ICMP";
+    return "IP-" + std::to_string(p);
+}
+
+void output(const Stats& s, const Options& o, uint64_t bytes, double seconds) {
+    std::cout << std::fixed << std::setprecision(6);
+    if (o.json) {
+        std::cout << "{\"mode\":\"" << o.mode << "\",\"threads\":" << o.threads
+                  << ",\"seconds\":" << seconds << ",\"file_bytes\":" << bytes
+                  << ",\"total\":" << s.total << ",\"invalid\":" << s.invalid
+                  << ",\"unsupported\":" << s.unsupported << ",\"filtered\":" << s.filtered
+                  << ",\"selected\":" << s.selected.packets << ",\"selected_bytes\":" << s.selected.bytes
+                  << ",\"protocols\":{";
+        bool first = true;
+        for (unsigned i = 0; i < 256; ++i) if (s.protocols[i].packets) {
+            if (!first) std::cout << ',';
+            first = false;
+            std::cout << '"' << protocol_name(i) << "\":[" << s.protocols[i].packets
+                      << ',' << s.protocols[i].bytes << ']';
+        }
+        std::cout << "},\"ips\":{";
+        // Сортировка нужна только для удобного сравнения и вывода, в замер не входит.
+        std::map<uint32_t, IPStat> sorted(s.ips.begin(), s.ips.end());
+        first = true;
+        for (const auto& [ip, st] : sorted) {
+            if (!first) std::cout << ',';
+            first = false;
+            std::cout << '"' << ip_string(ip) << "\":[" << st.sent.packets << ',' << st.sent.bytes
+                      << ',' << st.received.packets << ',' << st.received.bytes << ']';
+        }
+        std::cout << "}}\n";
+    } else {
+        std::cout << "Mode: " << o.mode << ", workers: " << (o.mode == "par" ? o.threads : 0)
+                  << "\nTime: " << seconds << " s\nThroughput: " << double(bytes) / MiB / seconds
+                  << " MiB/s\nPCAP bytes processed: " << bytes
+                  << "\nPackets: " << s.total << "\nSelected: " << s.selected.packets
+                  << "\nSelected wire bytes: " << s.selected.bytes << "\nFiltered: " << s.filtered
+                  << "\nInvalid: " << s.invalid << "\nUnsupported: " << s.unsupported << '\n';
+        for (unsigned i = 0; i < 256; ++i) if (s.protocols[i].packets)
+            std::cout << protocol_name(i) << ": " << s.protocols[i].packets
+                      << " packets, " << s.protocols[i].bytes << " bytes\n";
+        std::vector<std::pair<uint32_t, IPStat>> top(s.ips.begin(), s.ips.end());
+        std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
+            uint64_t x = a.second.sent.bytes + a.second.received.bytes;
+            uint64_t y = b.second.sent.bytes + b.second.received.bytes;
+            return x != y ? x > y : a.first < b.first;
+        });
+        std::cout << "Unique IPs: " << s.ips.size() << "\nTop IPs (sent + received bytes):\n";
+        for (size_t i = 0; i < std::min<size_t>(10, top.size()); ++i)
+            std::cout << ip_string(top[i].first) << ": " << top[i].second.sent.packets
+                      << " sent, " << top[i].second.received.packets << " received, "
+                      << top[i].second.sent.bytes + top[i].second.received.bytes << " bytes\n";
+    }
+}
+
+int main(int argc, char** argv) {
+    try {
+        Options o = arguments(argc, argv);
+        auto begin = std::chrono::steady_clock::now();
+        Reader reader(o);
+        Stats stats = run(reader, o);
+        double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+        output(stats, o, reader.bytes, seconds);
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << '\n'; return 1;
+    }
+}

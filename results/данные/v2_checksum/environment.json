@@ -1,0 +1,39 @@
+{
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "logical_cpus": 8,
+  "input": "data/traffic_10gib.pcap",
+  "input_bytes": 10737417294,
+  "sizes_mib": [
+    100,
+    500,
+    1024,
+    5120,
+    10240
+  ],
+  "threads": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "repeats": 3,
+  "analysis_flags": [
+    "--checksum"
+  ],
+  "started": "2026-11-18T23:03:32+0300",
+  "compiler": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
+  "sources_sha256": {
+    "analyze.cpp": "bae33083179e9d006c333eebc26e656bd231e2d9886505979bd129378c0c5655",
+    "generate.cpp": "24da54fe95a7199d4d2eb335789c610523dd87e8549d6ca3d99dac35cb4e2d59",
+    "common.h": "9695db56abde507079f688cb45c54718df96fa25316a2b647d668cb198c30f13",
+    "Makefile": "aadb529ec074580c4fd4ca77f5b1cad8eb295e725debb2a788e41bfe51f9ff1f"
+  },
+  "cache_policy": "One sequential warm-up per size; OS cache is not cleared. Mixed cache conditions.",
+  "hw.model": "Mac14,2",
+  "hw.memsize": "17179869184",
+  "hw.physicalcpu": "8",
+  "hw.perflevel0.physicalcpu": "4",
+  "hw.perflevel1.physicalcpu": "4",
+  "finished": "2026-11-18T23:06:07+0300"
+}
