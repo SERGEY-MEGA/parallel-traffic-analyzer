@@ -2,12 +2,13 @@
   "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
   "machine": "arm64",
   "logical_cpus": 8,
-  "input": "data/traffic_10gib.pcap",
+  "input": "/Users/sergejmegeran/Desktop/ParralellProgramm/TrafficAnalysis/data/traffic_10gib.pcap",
   "input_bytes": 10737417294,
   "sizes_mib": [
     100,
     500,
     1024,
+    2048,
     5120,
     10240
   ],
@@ -17,16 +18,16 @@
     4,
     8
   ],
-  "repeats": 3,
+  "repeats": 5,
   "analysis_flags": [
     "--checksum"
   ],
-  "started": "2026-11-18T23:03:32+0300",
+  "started": "2026-11-20T09:08:11+0300",
   "compiler": "Apple clang version 21.0.0 (clang-2100.3.34.2)",
   "sources_sha256": {
-    "analyze.cpp": "bae33083179e9d006c333eebc26e656bd231e2d9886505979bd129378c0c5655",
-    "generate.cpp": "24da54fe95a7199d4d2eb335789c610523dd87e8549d6ca3d99dac35cb4e2d59",
-    "common.h": "9695db56abde507079f688cb45c54718df96fa25316a2b647d668cb198c30f13",
+    "analyze.cpp": "f705052b534f0b97c1c5b3afd6fff28ec76dbe529e9ccf4ea2cf14fff0e95a8a",
+    "generate.cpp": "80ae9ceea457e538e9ec03e78e1939067abd627004bf352395eaf2290b4ed24a",
+    "common.h": "3c46d354da30b83e9c0f3f17a122fe1d3a89918986a85f5b06fc4857a583f813",
     "Makefile": "aadb529ec074580c4fd4ca77f5b1cad8eb295e725debb2a788e41bfe51f9ff1f"
   },
   "cache_policy": "One sequential warm-up per size; OS cache is not cleared. Mixed cache conditions.",
@@ -35,5 +36,5 @@
   "hw.physicalcpu": "8",
   "hw.perflevel0.physicalcpu": "4",
   "hw.perflevel1.physicalcpu": "4",
-  "finished": "2026-11-18T23:06:07+0300"
+  "finished": "2026-11-20T09:12:36+0300"
 }

@@ -1,7 +1,7 @@
 {
   "mode": "seq",
   "threads": 1,
-  "seconds": 0.212795,
+  "seconds": 0.1327,
   "file_bytes": 1073740452,
   "total": 1614642,
   "invalid": 0,

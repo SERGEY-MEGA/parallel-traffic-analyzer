@@ -3,7 +3,7 @@
 Использование: python plot_compare.py [папка results]
 Читает results/данные/v2_basic, v2_checksum, v2_signatures. Главные графики (why.png,
 compare_100mib.png, compare_1024mib.png, compare_10240mib.png, by_size.png, all.png,
-all_lines.png, protocols.png) кладёт в results/, остальные и compare.csv — в results/дополнительно/.
+all_lines.png, growth.png, protocols.png) кладёт в results/, остальные и compare.csv — в results/дополнительно/.
 """
 import csv
 import os
@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 SERIES = [('v2_basic', 'Только заголовки'),
           ('v2_checksum', 'Заголовки + контрольные суммы'),
           ('v2_signatures', 'Заголовки + поиск сигнатур')]
+SIZE_NAMES = {100: '100 МиБ', 500: '500 МиБ', 1024: '1 ГиБ', 2048: '2 ГиБ', 5120: '5 ГиБ', 10240: '10 ГиБ'}
 
 
 def load(folder):
@@ -97,7 +98,7 @@ def by_size(root, data, threads=4):
     ax.axhline(1, color='black', linewidth=0.6)
     ax.axhline(threads, color='black', linestyle='--', linewidth=0.8, label=f'идеал: {threads}×')
     ax.set_xscale('log')
-    ax.set_xticks(sizes, ['100 МиБ', '500 МиБ', '1 ГиБ', '5 ГиБ', '10 ГиБ'][:len(sizes)])
+    ax.set_xticks(sizes, [SIZE_NAMES.get(x, f'{x} МиБ') for x in sizes])
     ax.minorticks_off()
     ax.set(xlim=(80, max(sizes) * 1.4), ylim=(0, threads + 1), xlabel='Объём входных данных (лог. шкала)',
            ylabel='Ускорение Tseq / Tpar',
@@ -115,7 +116,7 @@ def overview(root, data):
     from matplotlib.colors import LinearSegmentedColormap
     cmap = LinearSegmentedColormap.from_list('speed', ['#f4f4f4', '#f6c9a8', '#e0743a', '#a63a0f'])
     sizes = sorted({r['size_mib'] for r in data['v2_basic']})
-    size_names = {100: '100 МиБ', 500: '500 МиБ', 1024: '1 ГиБ', 5120: '5 ГиБ', 10240: '10 ГиБ'}
+    size_names = SIZE_NAMES
     configs = [('seq', 1), ('par', 1), ('par', 2), ('par', 4), ('par', 8)]
     labels = ['1 поток\n(seq)', '1 раб.\n+ чтение', '2 раб.', '4 раб.', '8 раб.']
     fig, axes = plt.subplots(1, 3, figsize=(15, 5.4), layout='constrained')
@@ -157,9 +158,9 @@ def threads_lines(root, data):
     if len(data) < 3:
         return
     sizes = sorted({r['size_mib'] for r in data['v2_basic']})
-    size_names = {100: '100 МиБ', 500: '500 МиБ', 1024: '1 ГиБ', 5120: '5 ГиБ (диск)', 10240: '10 ГиБ (диск)'}
-    colors = {100: '#9ecae1', 500: '#4292c6', 1024: '#08306b', 5120: '#fd8d3c', 10240: '#a63603'}
-    styles = {100: 'o-', 500: 'o-', 1024: 'o-', 5120: 's--', 10240: 's--'}
+    size_names = {**SIZE_NAMES, 5120: '5 ГиБ (диск)', 10240: '10 ГиБ (диск)'}
+    colors = {100: '#9ecae1', 500: '#6baed6', 1024: '#2171b5', 2048: '#08306b', 5120: '#fd8d3c', 10240: '#a63603'}
+    styles = {100: 'o-', 500: 'o-', 1024: 'o-', 2048: 'o-', 5120: 's--', 10240: 's--'}
     ps = [1, 2, 4, 8]
     fig, axes = plt.subplots(1, 3, figsize=(15, 5.2), layout='constrained', sharey=True)
     for ax, (name, title) in zip(axes, SERIES):
@@ -234,9 +235,42 @@ def protocols(root):
     right.set_xticks(list(x), [f'{names[p]}\nпоиск: {c:.2f} мс/МБ' for p, c in zip(order, cost)], fontsize=9)
     right.set(ylabel='Ускорение seq / par 4', ylim=(0, 5), title='Ускорение на 4 потоках')
     right.grid(axis='y', alpha=0.25); right.legend(loc='upper right', fontsize=8.5)
-    fig.suptitle('По протоколам: цена мегабайта одинаковая (≈ 1 мс/МБ), ускорение зависит от того, '
+    fig.suptitle(f'По протоколам: цена мегабайта одинаковая (≈ {sum(cost) / len(cost):.1f} мс/МБ), ускорение зависит от того, '
                  'сколько работы осталось после фильтра', fontsize=12)
     fig.savefig(root / 'protocols.png', dpi=160)
+    plt.close(fig)
+
+
+def growth(root, data):
+    """Главный график роста: поиск сигнатур, объёмы в памяти, ускорение от числа потоков (линия на объём)."""
+    if 'v2_signatures' not in data:
+        return
+    rows = data['v2_signatures']
+    sizes = sorted({r['size_mib'] for r in rows if r['size_mib'] <= 4096})
+    colors = {100: '#f4a582', 500: '#e0703d', 1024: '#c4461b', 2048: '#7f2704'}
+    ps = [1, 2, 4, 8]
+    fig, ax = plt.subplots(figsize=(10, 6), layout='constrained')
+    ax.plot([0, 8.5], [0, 8.5], ':', color='black', linewidth=1, label='идеал S = P')
+    ax.axhline(1, color='black', linewidth=0.6)
+    for size in sizes:
+        pts = sorted(((r['threads'], r['speedup']) for r in rows
+                      if r['size_mib'] == size and r['mode'] == 'par'), key=lambda x: x[0])
+        xs, ys = [x for x, _ in pts], [y for _, y in pts]
+        ax.plot(xs, ys, 'o-', color=colors.get(size, '#c4461b'), linewidth=3, markersize=9,
+                label=SIZE_NAMES.get(size, f'{size} МиБ'))
+        # подписи соседних линий разводим по вертикали, чтобы не наезжали
+        shift = {100: -9, 500: -11, 1024: 2, 2048: 17}.get(size, 0)
+        ax.annotate(f'{SIZE_NAMES.get(size, size)}: {ys[-1]:.2f}×', (xs[-1], ys[-1]), textcoords='offset points',
+                    xytext=(10, shift),
+                    va='center', fontsize=13, weight='bold', color=colors.get(size, '#c4461b'))
+    ax.set(xticks=ps, xlim=(0.6, 10.8), ylim=(0, 8.5), xlabel='Рабочих потоков P',
+           ylabel='Ускорение Tseq / Tpar',
+           title='Поиск сигнатур, данные в памяти: прирост растёт с числом потоков')
+    ax.grid(alpha=0.25)
+    ax.tick_params(labelsize=13)
+    ax.xaxis.label.set_size(14); ax.yaxis.label.set_size(14); ax.title.set_size(15)
+    ax.legend(loc='upper left', fontsize=13, title='Объём данных', title_fontsize=13)
+    fig.savefig(root / 'growth.png', dpi=160)
     plt.close(fig)
 
 
@@ -286,6 +320,7 @@ def main():
     by_size(root, data)
     overview(root, data)
     threads_lines(root, data)
+    growth(root, data)
     protocols(root)
     (extra / 'compare.csv').write_text('\n'.join(lines) + '\n', encoding='utf-8')
     print('\n'.join(lines))
